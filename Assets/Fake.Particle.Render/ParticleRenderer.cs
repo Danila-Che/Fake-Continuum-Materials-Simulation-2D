@@ -1,18 +1,15 @@
+using System;
 using Unity.Collections;
-using Unity.Mathematics;
+using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 
 namespace Fake.Particle.Render
 {
-    public class ParticleRenderer : MonoBehaviour
+    [Serializable]
+    public struct ParticleRenderer : IDisposable
     {
-        private struct Particle
-        {
-            public float2 position;
-        }
-
-        private const int k_CommandCount = 1;
-
+        private static readonly int ParticleBufferProperty = Shader.PropertyToID("particle_buffer");
+        
         [SerializeField] private Material m_Material;
         [SerializeField] private Mesh m_Mesh;
 
@@ -21,58 +18,58 @@ namespace Fake.Particle.Render
         private RenderParams m_RenderParams;
 
         private ComputeBuffer m_ParticleBuffer;
-        private NativeArray<Particle> m_Particles;
+        
+        private bool m_IsDisposed;
 
-        private void OnEnable()
+        public void Initialize(int bufferSize)
         {
-            m_CommandBuffer = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, k_CommandCount, GraphicsBuffer.IndirectDrawIndexedArgs.size);
-            m_CommandData = new GraphicsBuffer.IndirectDrawIndexedArgs[k_CommandCount];
-
+            CheckDisposed();
+            
             m_RenderParams = new RenderParams(m_Material)
             {
                 worldBounds = new Bounds(Vector3.zero, 100 * Vector3.one),
                 matProps = new MaterialPropertyBlock()
             };
-
+            
+            m_CommandBuffer = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1, GraphicsBuffer.IndirectDrawIndexedArgs.size);
+            m_CommandData = new GraphicsBuffer.IndirectDrawIndexedArgs[1];
             m_CommandData[0].indexCountPerInstance = m_Mesh.GetIndexCount(0);
-            m_CommandData[0].instanceCount = 2;
+            m_CommandData[0].instanceCount = (uint)bufferSize;
             m_CommandBuffer.SetData(m_CommandData);
 
-            m_ParticleBuffer = new ComputeBuffer(2, 8, ComputeBufferType.Default);
-            m_Particles = new NativeArray<Particle>(2, Allocator.Persistent);
-            m_Particles[0] = new Particle
-            {
-                position = new float2(-1.0f, 0.0f),
-            };
-
-            m_Particles[1] = new Particle
-            {
-                position = new float2(1.0f, 0.0f),
-            };
-
-            m_ParticleBuffer.SetData(m_Particles);
-
-            m_Material.SetBuffer("particle_buffer", m_ParticleBuffer);
+            m_ParticleBuffer = new ComputeBuffer(bufferSize, UnsafeUtility.SizeOf(typeof(Dynamics.Particle)), ComputeBufferType.Default);
+            m_Material.SetBuffer(ParticleBufferProperty, m_ParticleBuffer);
         }
 
-        private void OnDisable()
+        public void SetParticles(NativeArray<Dynamics.Particle> particles)
         {
+            CheckDisposed();
+            m_ParticleBuffer.SetData(particles);
+        }
+
+        public void Render()
+        {
+            CheckDisposed();
+            Graphics.RenderMeshIndirect(m_RenderParams, m_Mesh, m_CommandBuffer);
+        }
+
+        public void Dispose()
+        {
+            m_IsDisposed = true;
+            
             m_CommandBuffer?.Release();
             m_CommandBuffer = null;
 
             m_ParticleBuffer?.Release();
             m_ParticleBuffer = null;
-
-            if (m_Particles.IsCreated)
-            {
-                m_Particles.Dispose();
-                m_Particles = default;
-            }
         }
-
-        private void Update()
+        
+        private void CheckDisposed()
         {
-            Graphics.RenderMeshIndirect(m_RenderParams, m_Mesh, m_CommandBuffer, k_CommandCount);
+            if (m_IsDisposed)
+            {
+                throw new ObjectDisposedException(GetType().Name);
+            }
         }
     }
 }

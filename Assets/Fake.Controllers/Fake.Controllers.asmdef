@@ -1,8 +1,9 @@
 {
-    "name": "Fake.Particle.Render",
-    "rootNamespace": "Fake.Particle.Render",
+    "name": "Fake.Controllers",
+    "rootNamespace": "Fake.Controllers",
     "references": [
         "GUID:32e22d165109e8648a72fd2f1c344d3b",
+        "GUID:ecfd80d388240abbc85f1650e1d04ced",
         "GUID:d8b63aba1907145bea998dd612889d6b"
     ],
     "includePlatforms": [],
