@@ -1,0 +1,20 @@
+{
+    "name": "Fake.Tests",
+    "rootNamespace": "Fake.Tests",
+    "references": [
+        "GUID:bb77025e0d4b3294d8e85480669ee502"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

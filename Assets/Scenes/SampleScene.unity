@@ -225,7 +225,7 @@ Camera:
   far clip plane: 10
   field of view: 34
   orthographic: 1
-  orthographic size: 5
+  orthographic size: 3.25
   m_Depth: -1
   m_CullingMask:
     serializedVersion: 2
@@ -304,6 +304,14 @@ MonoBehaviour:
   m_ParticleRenderer:
     m_Material: {fileID: 2100000, guid: e377ccba300b704ba8c73ec635231bc2, type: 2}
     m_Mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
+    m_BoxSize: 0.1
+  m_GravitationalAcceleration:
+    x: 0
+    y: -9.81
+  m_SolverArgs:
+    ElasticLambda: 15
+    ElasticMu: 5
+    IterationNumber: 5
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

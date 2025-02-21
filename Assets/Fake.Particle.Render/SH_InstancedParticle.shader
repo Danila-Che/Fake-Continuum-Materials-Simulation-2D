@@ -21,6 +21,11 @@ Shader "Instanced/SH_InstancedParticle"
             struct Particle
             {
                 float2 position;
+                float2 velocity;
+                float2x2 affine_momentum;
+                float2x2 deformation_dradient;
+                float mass;
+                float volume0;
             };
 
             struct v2f
@@ -30,20 +35,22 @@ Shader "Instanced/SH_InstancedParticle"
 
             fixed4 _Color;
             float _Size;
+            float2 _GridHalfSize;
+            float _BoxSize;
 
-            StructuredBuffer<Particle> particle_buffer;
+            StructuredBuffer<Particle> _ParticleBuffer;
 
             v2f vert(appdata_base v, uint svInstanceID : SV_InstanceID)
             {
-                uint instanceID = GetIndirectInstanceID(svInstanceID);
+                uint instance_id = GetIndirectInstanceID(svInstanceID);
                 
-                float3 data = float3(particle_buffer[instanceID].position, 0.0f);
+                float3 data = float3((_ParticleBuffer[instance_id].position - _GridHalfSize) * _BoxSize, 0.0f);
 
-                float3 localPosition = v.vertex.xyz * _Size;
-                float3 worldPosition = data + localPosition;
+                float3 local_position = v.vertex.xyz * _Size;
+                float3 world_position = data + local_position;
                 
                 v2f o;
-                o.pos = mul(UNITY_MATRIX_VP, float4(worldPosition, 1.0f));
+                o.pos = mul(UNITY_MATRIX_VP, float4(world_position, 1.0f));
                 return o;
             }
 

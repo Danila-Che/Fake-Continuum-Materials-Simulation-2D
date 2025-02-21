@@ -1,17 +1,21 @@
 using System;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
+using Unity.Mathematics;
 using UnityEngine;
 
 namespace Fake.Particle.Render
 {
     [Serializable]
-    public struct ParticleRenderer : IDisposable
+    public class ParticleRenderer : IDisposable
     {
-        private static readonly int ParticleBufferProperty = Shader.PropertyToID("particle_buffer");
-        
+        private static readonly int ParticleBufferProperty = Shader.PropertyToID("_ParticleBuffer");
+        private static readonly int GridHalfSizeProperty = Shader.PropertyToID("_GridHalfSize");
+        private static readonly int BoxSizeProperty = Shader.PropertyToID("_BoxSize");
+
         [SerializeField] private Material m_Material;
         [SerializeField] private Mesh m_Mesh;
+        [SerializeField] private float m_BoxSize;
 
         private GraphicsBuffer m_CommandBuffer;
         private GraphicsBuffer.IndirectDrawIndexedArgs[] m_CommandData;
@@ -21,7 +25,7 @@ namespace Fake.Particle.Render
         
         private bool m_IsDisposed;
 
-        public void Initialize(int bufferSize)
+        public void Initialize(int bufferSize, int2 gridResolution)
         {
             CheckDisposed();
             
@@ -37,8 +41,10 @@ namespace Fake.Particle.Render
             m_CommandData[0].instanceCount = (uint)bufferSize;
             m_CommandBuffer.SetData(m_CommandData);
 
-            m_ParticleBuffer = new ComputeBuffer(bufferSize, UnsafeUtility.SizeOf(typeof(Dynamics.Particle)), ComputeBufferType.Default);
+            m_ParticleBuffer = new ComputeBuffer(bufferSize, UnsafeUtility.SizeOf<Dynamics.Particle>(), ComputeBufferType.Default);
             m_Material.SetBuffer(ParticleBufferProperty, m_ParticleBuffer);
+            m_Material.SetVector(GridHalfSizeProperty, (Vector2)(0.5f * (float2)gridResolution));
+            m_Material.SetFloat(BoxSizeProperty, m_BoxSize);
         }
 
         public void SetParticles(NativeArray<Dynamics.Particle> particles)
@@ -55,6 +61,8 @@ namespace Fake.Particle.Render
 
         public void Dispose()
         {
+            CheckDisposed();
+            
             m_IsDisposed = true;
             
             m_CommandBuffer?.Release();
