@@ -21,11 +21,14 @@ Shader "Instanced/SH_InstancedParticle"
             struct Particle
             {
                 float2 position;
-                float2 velocity;
-                float2x2 affine_momentum;
-                float2x2 deformation_dradient;
+                float2 displacement;
+                float2x2 deformation_gradient;
+                float2x2 deformation_displacement;
+                
+                float liquid_density;
                 float mass;
-                float volume0;
+                float volume;
+                float logJp;
             };
 
             struct v2f

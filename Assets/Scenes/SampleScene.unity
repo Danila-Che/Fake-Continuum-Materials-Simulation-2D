@@ -309,8 +309,15 @@ MonoBehaviour:
     x: 0
     y: -9.81
   m_SolverArgs:
-    ElasticLambda: 15
-    ElasticMu: 5
+    MaterialType: 0
+    FixedPointMultiplier: 7
+    UseGridVolumeForLiquid: 1
+    ElasticityRatio: 0.07
+    LiquidRelaxation: 1
+    ElasticRelaxation: 1
+    LiquidViscosity: 0
+    FrictionAngle: 30
+    ViscoPlasticity: 0.9
     IterationNumber: 5
 --- !u!1660057539 &9223372036854775807
 SceneRoots:

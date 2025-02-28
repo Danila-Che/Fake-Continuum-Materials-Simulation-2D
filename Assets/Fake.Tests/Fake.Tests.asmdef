@@ -2,13 +2,15 @@
     "name": "Fake.Tests",
     "rootNamespace": "Fake.Tests",
     "references": [
-        "GUID:bb77025e0d4b3294d8e85480669ee502"
+        "GUID:4fec76c6ff6a22f4a9c24812e5fe6a74",
+        "GUID:bb77025e0d4b3294d8e85480669ee502",
+        "GUID:d8b63aba1907145bea998dd612889d6b"
     ],
     "includePlatforms": [
         "Editor"
     ],
     "excludePlatforms": [],
-    "allowUnsafeCode": false,
+    "allowUnsafeCode": true,
     "overrideReferences": true,
     "precompiledReferences": [
         "nunit.framework.dll"

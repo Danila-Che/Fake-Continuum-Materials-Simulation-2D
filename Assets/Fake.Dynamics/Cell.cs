@@ -4,8 +4,8 @@ namespace Fake.Dynamics
 {
     public struct Cell
     {
-        public float2 velocity;
-        public float mass;
-        public float _;
+        public int2 displacement;
+        public int mass;
+        public int volume;
     }
 }

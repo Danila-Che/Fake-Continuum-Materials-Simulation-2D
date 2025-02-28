@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using Fake.Utilities;
 using Unity.Burst;
 using Unity.Collections;
@@ -8,74 +9,138 @@ using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.Profiling;
+
+using static Unity.Mathematics.math;
+using static Fake.Utilities.MatrixUtility;
+using static Fake.Utilities.FixedPointUtility;
+using float2x2 = Unity.Mathematics.float2x2;
 
 namespace Fake.Dynamics
 {
     public class DynamicsSolver : IDisposable
     {
-        [BurstCompile]
-        private struct ParticleToGridJob : IJob
+        public enum MaterialType
         {
-            [WriteOnly] public NativeArray<Cell> grid;
-            [ReadOnly] public NativeArray<Particle> particles;
-        
-            public int gridResolution;
-            public float elasticMu;
-            public float elasticLambda;
-            public float deltaTime;
+            Liquid,
+            Sand,
+            Visco,
+            Elastic
+        }
+
+        [BurstCompile]
+        private unsafe struct ParticleUpdateJob : IJobParallelFor
+        {
+            [NativeDisableUnsafePtrRestriction]
+            public Particle* particlePtr;
             
-            public unsafe void Execute()
+            public MaterialType materialType;
+            public float elasticityRatio;
+            public float liquidRelaxation;
+            public float elasticRelaxation;
+            public float liquidViscosity;
+            
+            public void Execute(int i)
+            {
+                var particle = particlePtr[i];
+
+                if (materialType is MaterialType.Liquid)
+                {
+                    float2x2 deviatoric = -1.0f * (particle.deformationDisplacement + transpose(particle.deformationDisplacement));
+                    particle.deformationDisplacement += liquidViscosity * 0.5f * deviatoric;
+
+                    float alpha = 0.5f * (1.0f / particle.liquidDensity - Tr(particle.deformationDisplacement) - 1.0f);
+                    particle.deformationDisplacement += liquidRelaxation * alpha * float2x2.identity;
+                }
+                if (materialType is MaterialType.Sand)
+                {
+                    particle.deformationGradient = float2x2.identity;
+                    
+                    float2x2 F = mul(float2x2.identity + particle.deformationDisplacement, particle.deformationGradient);
+                    
+                    var svdResult = SingularValuesDecomposition(F);
+                    
+                    if (particle.logJp == 0.0f)
+                    {
+                        svdResult.sigma = clamp(svdResult.sigma, 1.0f, 1000.0f);
+                    }
+                    
+                    float df = determinant(F);
+                    float cdf = clamp(abs(df), 0.1f, 1000.0f);
+                    float2x2 Q = 1.0f / (sign(df) * sqrt(cdf)) * F;
+                    
+                    float2x2 elasticPart = mul(mul(svdResult.u, Diagonal(svdResult.sigma)), svdResult.vt);
+                    float alpha = elasticityRatio;
+                    float2x2 tgt = alpha * elasticPart + (1.0f - alpha) * Q;
+                    
+                    float2x2 diff = mul(tgt, inverse(particle.deformationGradient)) - float2x2.identity - particle.deformationDisplacement;
+                    particle.deformationDisplacement += elasticRelaxation * diff;
+                    
+                    float2x2 deviatoric = -1.0f * (particle.deformationDisplacement + transpose(particle.deformationDisplacement));
+                    particle.deformationDisplacement += liquidViscosity * 0.5f * deviatoric;
+                }
+                else if (materialType is MaterialType.Visco or MaterialType.Elastic)
+                {
+                    float2x2 F = mul(float2x2.identity + particle.deformationDisplacement, particle.deformationGradient);
+
+                    var svdResult = SingularValuesDecomposition(F);
+                    
+                    float df = determinant(F);
+                    float cdf = clamp(abs(df), 0.1f, 1000.0f);
+                    float2x2 Q = 1.0f / (sign(df) * sqrt(cdf)) * F;
+
+                    float alpha = elasticityRatio;
+                    float2x2 tgt = alpha * mul(svdResult.u, svdResult.vt) + (1.0f - alpha) * Q;
+
+                    float2x2 diff = mul(tgt, inverse(particle.deformationGradient)) - float2x2.identity - particle.deformationDisplacement;
+                    particle.deformationDisplacement += elasticRelaxation * diff;
+                }
+
+                particlePtr[i] = particle;
+            }
+        }
+        
+        [BurstCompile]
+        private unsafe struct ParticleToGridJob : IJobParallelFor
+        {
+            [NativeDisableUnsafePtrRestriction]
+            public Cell* gridPtr;
+            [ReadOnly]
+            [NativeDisableUnsafePtrRestriction]
+            public Particle* particlePtr;
+
+            public uint fixedPointMultiplier;            
+            
+            public bool useGridVolumeForLiquid;
+            public int gridResolution;
+
+            public void Execute(int i)
             {
                 var weights = stackalloc float2[3];
-                
-                var length = particles.Length;
-                var particlesPtr = (Particle*)particles.GetUnsafeReadOnlyPtr();
-                var gridPtr = (Cell*)grid.GetUnsafePtr();
-        
-                for (int i = 0; i < length; i++)
+                var particle = particlePtr[i];
+                uint2 cellCoordinate = CalculateQuadraticInterpolationWeights(weights, particle);
+
+                for (uint gx = 0; gx < 3; gx++)
                 {
-                    var particle = particlesPtr[i];
-        
-                    var F = particle.deformationGradient;
-                    var J = math.determinant(F);
-                    var volume = particle.volume0 * J;
-        
-                    var FT = math.transpose(F);
-                    var FinvT = math.inverse(FT);
-                    var FminusFinvT = F - FinvT;
-                    
-                    var Ptemp0 = elasticMu * FminusFinvT;
-                    var Ptemp1 = elasticLambda * math.log(J) * FinvT;
-                    var P = Ptemp0 + Ptemp1;
-        
-                    float2x2 stress = (1.0f / J) * math.mul(P, FT);
-        
-                    var eq16term0 = -volume * 4 * stress * deltaTime;
-                    
-                    uint2 cellCoordinate = (uint2)particle.position;
-                    CalculateQuadraticInterpolationWeights(weights, particle, cellCoordinate);
-        
-                    for (uint gx = 0; gx < 3; gx++)
+                    for (uint gy = 0; gy < 3; gy++)
                     {
-                        for (uint gy = 0; gy < 3; gy++)
+                        float weight = GetWeight(weights, gx, gy);
+                        uint2 neighborCellCoordinate = cellCoordinate + uint2(gx, gy) - 1;
+                        
+                        int cellIndex = GetCellIndex(gridResolution, neighborCellCoordinate);
+                        
+                        float weightedMass = weight * particle.mass;
+                        Interlocked.Add(ref gridPtr[cellIndex].mass, EncodeFixedPoint(weightedMass, fixedPointMultiplier));
+                        
+                        float2 cellDistance = neighborCellCoordinate - particle.position + 0.5f;
+                        float2 Q = mul(particle.deformationDisplacement, cellDistance);
+                        float2 momentum = weightedMass * (particle.displacement + Q);
+                        Interlocked.Add(ref gridPtr[cellIndex].displacement.x, EncodeFixedPoint(momentum.x, fixedPointMultiplier));
+                        Interlocked.Add(ref gridPtr[cellIndex].displacement.y, EncodeFixedPoint(momentum.y, fixedPointMultiplier));
+
+                        if (useGridVolumeForLiquid)
                         {
-                            float weight = GetWeight(weights, gx, gy);
-                            
-                            var neighborCellCoordinate = new uint2(cellCoordinate.x + gx - 1, cellCoordinate.y + gy - 1);
-                            float2 cellDistance = neighborCellCoordinate - particle.position + 0.5f;
-                            float2 q = math.mul(particle.affineMomentum, cellDistance);
-                            
-                            int cellIndex = GetCellIndex(gridResolution, neighborCellCoordinate);
-                            var cell = gridPtr[cellIndex];
-                            
-                            float massContribution = weight * particle.mass;
-                            cell.mass += massContribution;
-                            cell.velocity += massContribution * (particle.velocity + q); // momentum
-        
-                            float2 momentum = math.mul(eq16term0 * weight, cellDistance);
-                            cell.velocity += momentum;
-                            
-                            gridPtr[cellIndex] = cell;
+                            Interlocked.Add(ref gridPtr[cellIndex].volume, EncodeFixedPoint(particle.volume * weight, fixedPointMultiplier));
                         }
                     }
                 }
@@ -83,144 +148,216 @@ namespace Fake.Dynamics
         }
 
         [BurstCompile]
-        private struct GridUpdateJob : IJob
+        private unsafe struct GridUpdateJob : IJobParallelFor
         {
-            public NativeArray<Cell> grid;
+            [NativeDisableUnsafePtrRestriction]
+            public Cell* gridPtr;
+
+            public uint fixedPointMultiplier;
             
             public int gridResolution;
             public float2 acceleration;
             public float deltaTime;
             
-            public unsafe void Execute()
+            public void Execute(int i)
             {
-                var length = grid.Length;
-                var gridPtr = (Cell*)grid.GetUnsafePtr();
-                
-                for (int i = 0; i < length; i++)
+                var cell = gridPtr[i];
+
+                float2 displacement = DecodeFixedPoint(cell.displacement, fixedPointMultiplier);
+                float mass = DecodeFixedPoint(cell.mass, fixedPointMultiplier);
+
+                if (mass > 0.0f)
                 {
-                    var cell = gridPtr[i];
+                    displacement /= mass;
+                    displacement += acceleration * deltaTime;
 
-                    if (cell.mass > 0.0f)
+                    int x = i / gridResolution;
+                    int y = i - x * gridResolution;
+
+                    if (x < 2 || x > gridResolution - 3)
                     {
-                        cell.velocity /= cell.mass;
-                        cell.velocity += acceleration * deltaTime;
-
-                        int x = i / gridResolution;
-                        int y = i - x * gridResolution;
-
-                        if (x < 2 || x > gridResolution - 3)
-                        {
-                            cell.velocity.x = 0.0f;
-                        }
-
-                        if (y < 2 || y > gridResolution - 3)
-                        {
-                            cell.velocity.y = 0.0f;
-                        }
-
-                        grid[i] = cell;
-                    }
-                }
-            }
-        }
-
-        [BurstCompile]
-        private struct GridToParticleJob : IJob
-        {
-            [ReadOnly]
-            public NativeArray<Cell> grid;
-            [WriteOnly]
-            public NativeArray<Particle> particles;
-            
-            public int gridResolution;
-            public float deltaTime;
-            
-            public unsafe void Execute()
-            {
-                var weights = stackalloc float2[3];
-                
-                var length = particles.Length;
-                var particlesPtr = (Particle*)particles.GetUnsafePtr();
-                var gridPtr = (Cell*)grid.GetUnsafeReadOnlyPtr();
-                
-                for (int i = 0; i < length; i++)
-                {
-                    var particle = particlesPtr[i];
-
-                    particle.velocity = new float2(0.0f);
-                    
-                    uint2 cellCoordinate = (uint2)particle.position;
-                    CalculateQuadraticInterpolationWeights(weights, particle, cellCoordinate);
-
-                    float2x2 B = new float2x2(0.0f);
-
-                    for (uint gx = 0; gx < 3; gx++)
-                    {
-                        for (uint gy = 0; gy < 3; gy++)
-                        {
-                            float weight = GetWeight(weights, gx, gy);
-                            
-                            var neighborCellCoordinate = new uint2(cellCoordinate.x + gx - 1, cellCoordinate.y + gy - 1);
-                            
-                            int cellIndex = GetCellIndex(gridResolution, neighborCellCoordinate);
-                            float2 distance = neighborCellCoordinate - particle.position + 0.5f;
-                            float2 weightedVelocity = gridPtr[cellIndex].velocity * weight;
-
-                            var term = new float2x2(weightedVelocity * distance.x, weightedVelocity * distance.y);
-
-                            B += term;
-                            
-                            particle.velocity += weightedVelocity;
-                        }
+                        displacement.x = 0.0f;
                     }
 
-                    particle.affineMomentum = B * 4;
+                    if (y < 2 || y > gridResolution - 3)
+                    {
+                        displacement.y = 0.0f;
+                    }
 
-                    var FNew = math.float2x2(
-                        1, 0,
-                        0, 1);
-                    
-                    FNew += deltaTime * particle.affineMomentum;
-                    
-                    particle.deformationGradient = math.mul(FNew, particle.deformationGradient);
-                    
-                    particlesPtr[i] = particle;
+                    cell.displacement = EncodeFixedPoint(displacement, fixedPointMultiplier);
+
+                    gridPtr[i] = cell;
                 }
             }
         }
         
         [BurstCompile]
-        private struct IntegrateParticlesJob : IJob
+        private unsafe struct GridToParticleJob : IJobParallelFor
         {
-            public NativeArray<Particle> particles;
+            [ReadOnly]
+            [NativeDisableUnsafePtrRestriction]
+            public Cell* gridPtr;
+            [NativeDisableUnsafePtrRestriction]
+            public Particle* particlePtr;
+            
+            public uint fixedPointMultiplier;
+            
+            public MaterialType materialType;
+            public bool useGridVolumeForLiquid;
+            public int gridResolution;
+            
+            public void Execute(int i)
+            {
+                var weights = stackalloc float2[3];
+                var particle = particlePtr[i];
 
+                uint2 cellCoordinate = CalculateQuadraticInterpolationWeights(weights, particle);
+                float2x2 B = float2x2(0.0f);
+                float2 displacement = float2(0.0f);
+                float volume = 0.0f;
+
+                for (uint gx = 0; gx < 3; gx++)
+                {
+                    for (uint gy = 0; gy < 3; gy++)
+                    {
+                        float weight = GetWeight(weights, gx, gy);
+                        uint2 neighborCellCoordinate = cellCoordinate + uint2(gx, gy) - 1;
+                        
+                        int cellIndex = GetCellIndex(gridResolution, neighborCellCoordinate);
+                        var cell = gridPtr[cellIndex];
+                        
+                        float2 weightedDisplacement = weight * DecodeFixedPoint(cell.displacement, fixedPointMultiplier);
+                        float2 distance = neighborCellCoordinate - particle.position + 0.5f;
+
+                        B += OuterProduct(weightedDisplacement, distance);
+                        displacement += weightedDisplacement;
+
+                        if (useGridVolumeForLiquid && materialType is MaterialType.Liquid)
+                        {
+                            volume += weight * DecodeFixedPoint(cell.volume, fixedPointMultiplier);
+                        }
+                    }
+                }
+
+                particle.deformationDisplacement = B * 4.0f;
+                particle.displacement = displacement;
+
+                if (useGridVolumeForLiquid)
+                {
+                    volume = 1.0f / max(volume, 1e-6f);
+
+                    if (volume < 1.0f)
+                    {
+                        particle.liquidDensity = lerp(particle.liquidDensity, volume, 0.1f);
+                    }
+                }
+                
+                particlePtr[i] = particle;
+            }
+        }
+        
+        [BurstCompile]
+        private unsafe struct IntegrateParticlesJob : IJobParallelFor
+        {
+            [NativeDisableUnsafePtrRestriction]
+            public Particle* particlePtr;
+            
+            public MaterialType materialType;
+            public float elasticityRatio;
+            public float frictionAngle;
+            public float plasticity;
             public float gridResolution;
             public float deltaTime;
             
-            public unsafe void Execute()
+            public void Execute(int i)
             {
-                var length = particles.Length;
-                var particlesPtr = (Particle*)particles.GetUnsafePtr();
+                var particle = particlePtr[i];
                 
-                for (int i = 0; i < length; i++)
+                if (materialType is MaterialType.Liquid)
                 {
-                    var particle = particlesPtr[i];
-
-                    particle.position += particle.velocity * deltaTime;
-                    particle.position = math.clamp(particle.position, new float2(1.0f), new float2(gridResolution - 2.0f));
-                    
-                    particlesPtr[i] = particle;
+                    particle.liquidDensity *= Tr(particle.deformationDisplacement) + 1.0f;
+                    particle.liquidDensity = max(particle.liquidDensity, 0.05f);
                 }
+                else
+                {
+                    particle.deformationGradient = (float2x2.identity + particle.deformationDisplacement) * particle.deformationGradient;
+                
+                    var svdResult = SingularValuesDecomposition(particle.deformationGradient);
+                
+                    svdResult.sigma = clamp(svdResult.sigma, 0.2f, 10_000.0f);
+                    
+                    if (materialType is MaterialType.Sand)
+                    {
+                        float sinPhi = sin(frictionAngle * TORADIANS);
+                        float alpha = sqrt(2.0f / 3.0f) * (2.0f * sinPhi) / (3.0f - sinPhi);
+                        float beta = 0.5f;
+                        
+                        float2 eDiag = log(max(abs(svdResult.sigma), 1e-6f));
+                        
+                        float2x2 eps = Diagonal(eDiag);
+                        float trace = Tr(eps) + particle.logJp;
+                        
+                        float2x2 eHat = eps - trace * 0.5f * float2x2.identity;
+                        float frobNrm = Length(eHat);
+                        
+                        if (trace >= 0.0f)
+                        {
+                            svdResult.sigma = float2(1.0f);
+                            particle.logJp = beta * trace;
+                        }
+                        else
+                        {
+                            particle.logJp = 0.0f;
+                            float deltaGammaI = frobNrm + (elasticityRatio + 1.0f) * trace * alpha;
+                        
+                            if (deltaGammaI > 0.0f)
+                            {
+                                float2 h = eDiag - deltaGammaI / frobNrm * (eDiag - trace * 0.5f);
+                
+                                svdResult.sigma = exp(h);
+                            }
+                        }
+                    }
+                    else if (materialType is MaterialType.Visco)
+                    {
+                        var yieldSurface = exp(1.0f - plasticity);
+                        var J = svdResult.sigma.x * svdResult.sigma.y;
+                        
+                        svdResult.sigma = clamp(svdResult.sigma, 1.0f / yieldSurface, yieldSurface);
+                        
+                        var newJ = svdResult.sigma.x * svdResult.sigma.y;
+                        svdResult.sigma *= sqrt(J / newJ);
+                    }
+                
+                    particle.deformationGradient = mul(mul(svdResult.u, Diagonal(svdResult.sigma)), svdResult.vt);
+                }
+
+                particle.position += particle.displacement * deltaTime;
+                particle.position = clamp(particle.position, 1.0f, gridResolution - 2.0f);
+                
+                particlePtr[i] = particle;
             }
         }
 
         [Serializable]
         public class SolverArgs
         {
+            public MaterialType MaterialType;
+            [Range(3, 10)]
+            public int FixedPointMultiplier = 7;
+            public bool UseGridVolumeForLiquid;
+            [Range(0.0f, 1.0f)]
+            public float ElasticityRatio = 1.0f;
+            [Range(0.0f, 10.0f)]
+            public float LiquidRelaxation = 1.0f;
+            [Range(0.0f, 10.0f)]
+            public float ElasticRelaxation = 1.0f;
+            [Range(0.0f, 1.0f)]
+            public float LiquidViscosity = 1.0f;
             [Min(0.0f)]
-            public float ElasticLambda = 10.0f;
-            [Min(0.0f)]
-            public float ElasticMu = 20.0f;
+            public float FrictionAngle = 45.0f;
+            [Range(0.0f, 1.0f)]
+            public float ViscoPlasticity = 1.0f;
             [Min(1)]
             public int IterationNumber = 1;
         }
@@ -231,10 +368,11 @@ namespace Fake.Dynamics
         private NativeArray<Particle> m_Particles;
         private NativeArray<Cell> m_Grid;
         
-        private readonly float2[] m_Weights = new float2[3];
         private readonly float2 m_GravitationalAcceleration;
         
         private bool m_IsDisposed;
+
+        private uint m_FixedPointMultiplier;
 
         public DynamicsSolver(int gridResolution, SolverArgs args, float2 gravitationalAcceleration)
         {
@@ -257,37 +395,6 @@ namespace Fake.Dynamics
             m_Particles = new NativeArray<Particle>(positions.Count, Allocator.Persistent);
         }
         
-        public void CalculateParticleVolumes()
-        {
-            ParticleToGrid(0.0f);
-
-            for (int i = 0; i < m_Particles.Length; i++)
-            {
-                var particle = m_Particles[i];
-                
-                uint2 cellCoordinate = (uint2)particle.position;
-                CalculateQuadraticInterpolationWeights(particle, cellCoordinate);
-
-                float density = 0.0f;
-
-                for (uint gx = 0; gx < 3; gx++)
-                {
-                    for (uint gy = 0; gy < 3; gy++)
-                    {
-                        float weight = GetWeight(gx, gy);
-                        var neighborCellCoordinate = new uint2(cellCoordinate.x + gx - 1, cellCoordinate.y + gy - 1);
-                        int cellIndex = GetCellIndex(neighborCellCoordinate);
-                        
-                        density += m_Grid[cellIndex].mass * weight;
-                    }
-                }
-
-                particle.volume0 = particle.mass / density;
-                
-                m_Particles[i] = particle;
-            }
-        }
-        
         public void Dispose()
         {
             CheckDisposed();
@@ -302,15 +409,23 @@ namespace Fake.Dynamics
         {
             CheckDisposed();
 
+            m_FixedPointMultiplier = 1;
+
+            for (int i = 0; i < m_SolverArgs.FixedPointMultiplier; i++)
+            {
+                m_FixedPointMultiplier *= 10;
+            }
+            
             deltaTime /= m_SolverArgs.IterationNumber;
             
             for (int i = 0; i < m_SolverArgs.IterationNumber; i++)
             {
                 ClearGrid();
-                ParticleToGrid(deltaTime);
+                ParticleToGrid();
                 GridUpdate(deltaTime, m_GravitationalAcceleration);
-                GridToParticle(deltaTime);
+                GridToParticle();
                 IntegrateParticles(deltaTime);
+                UpdateParticles();
             }
         }
 
@@ -340,96 +455,122 @@ namespace Fake.Dynamics
 
         private void ClearGrid()
         {
-            JobUtility.Fill(m_Grid, new Cell
+            Profiler.BeginSample(nameof(ClearGrid));
+            
+            new JobUtility.FillJob<Cell>
             {
-                velocity = new float2(0.0f),
-                mass = 0.0f
-            });
+                array = m_Grid,
+                value = new Cell
+                {
+                    displacement = 0,
+                    mass = 0,
+                    volume = 0
+                }
+            }.Run();
+            
+            Profiler.EndSample();
         }
 
-        private void ParticleToGrid(float deltaTime)
+        private unsafe void UpdateParticles()
         {
+            Profiler.BeginSample(nameof(UpdateParticles));
+            
+            new ParticleUpdateJob
+            {
+                particlePtr = (Particle*)m_Particles.GetUnsafePtr(),
+                materialType = m_SolverArgs.MaterialType,
+                elasticityRatio = m_SolverArgs.ElasticityRatio,
+                liquidRelaxation = m_SolverArgs.LiquidRelaxation,
+                elasticRelaxation = m_SolverArgs.ElasticRelaxation,
+                liquidViscosity = m_SolverArgs.LiquidViscosity
+            }.Schedule(m_Particles.Length, 64).Complete();
+            
+            Profiler.EndSample();
+        }
+
+        private unsafe void ParticleToGrid()
+        {
+            Profiler.BeginSample(nameof(ParticleToGrid));
+            
             new ParticleToGridJob
             {
-                grid = m_Grid,
-                particles = m_Particles,
-                elasticMu = m_SolverArgs.ElasticMu,
-                elasticLambda = m_SolverArgs.ElasticLambda,
-                deltaTime = deltaTime,
+                gridPtr = (Cell*)m_Grid.GetUnsafePtr(),
+                fixedPointMultiplier = m_FixedPointMultiplier,
+                useGridVolumeForLiquid = m_SolverArgs.UseGridVolumeForLiquid,
+                particlePtr = (Particle*)m_Particles.GetUnsafeReadOnlyPtr(),
                 gridResolution = m_GridResolution
-            }.Run();
+            }.Schedule(m_Particles.Length, 64).Complete();
+            
+            Profiler.EndSample();
         }
-
-        private void GridUpdate(float deltaTime, float2 acceleration)
+        
+        private unsafe void GridUpdate(float deltaTime, float2 acceleration)
         {
+            Profiler.BeginSample(nameof(GridUpdate));
+            
             new GridUpdateJob
             {
-                grid = m_Grid,
+                gridPtr = (Cell*)m_Grid.GetUnsafePtr(),
+                fixedPointMultiplier = m_FixedPointMultiplier,
                 gridResolution = m_GridResolution,
                 acceleration = acceleration,
                 deltaTime = deltaTime
-            }.Run();
-        }
-
-        private void GridToParticle(float deltaTime)
-        {
-            new GridToParticleJob
-            {
-                grid = m_Grid,
-                particles = m_Particles,
-                gridResolution = m_GridResolution,
-                deltaTime = deltaTime
-            }.Run();
-        }
-
-        private void IntegrateParticles(float deltaTime)
-        {
-            new IntegrateParticlesJob
-            {
-                particles = m_Particles,
-                gridResolution = m_GridResolution,
-                deltaTime = deltaTime
-            }.Run();
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private unsafe void CalculateQuadraticInterpolationWeights(Particle particle, uint2 cellCoordinate)
-        {
-            fixed (float2* ptr = m_Weights)
-            {
-                CalculateQuadraticInterpolationWeights(ptr, particle, cellCoordinate);
-            }
+            }.Schedule(m_Grid.Length, 64).Complete();
+            
+            Profiler.EndSample();
         }
         
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static unsafe void CalculateQuadraticInterpolationWeights(float2* weights, Particle particle, uint2 cellCoordinate)
+        private unsafe void GridToParticle()
         {
+            Profiler.BeginSample(nameof(GridToParticle));
+            
+            new GridToParticleJob
+            {
+                gridPtr = (Cell*)m_Grid.GetUnsafeReadOnlyPtr(),
+                fixedPointMultiplier = m_FixedPointMultiplier,
+                useGridVolumeForLiquid = m_SolverArgs.UseGridVolumeForLiquid,
+                particlePtr = (Particle*)m_Particles.GetUnsafePtr(),
+                gridResolution = m_GridResolution
+            }.Schedule(m_Particles.Length, 64).Complete();
+            
+            Profiler.EndSample();
+        }
+        
+        private unsafe void IntegrateParticles(float deltaTime)
+        {
+            Profiler.BeginSample(nameof(IntegrateParticles));
+            
+            new IntegrateParticlesJob
+            {
+                particlePtr = (Particle*)m_Particles.GetUnsafePtr(),
+                materialType = m_SolverArgs.MaterialType,
+                elasticityRatio = m_SolverArgs.ElasticityRatio,
+                frictionAngle = m_SolverArgs.FrictionAngle,
+                plasticity = m_SolverArgs.ViscoPlasticity,
+                gridResolution = m_GridResolution,
+                deltaTime = deltaTime
+            }.Schedule(m_Particles.Length, 64).Complete();
+            
+            Profiler.EndSample();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe uint2 CalculateQuadraticInterpolationWeights(float2* weights, Particle particle)
+        {
+            float2 cellCoordinate = floor(particle.position);
             float2 cellDifference = particle.position - cellCoordinate - 0.5f;
             
-            weights[0] = 0.5f * math.square(0.5f - cellDifference);
-            weights[1] = 0.75f - math.square(cellDifference);
-            weights[2] = 0.5f * math.square(0.5f + cellDifference);
-        }
+            weights[0] = 0.5f * square(0.5f - cellDifference);
+            weights[1] = 0.75f - square(cellDifference);
+            weights[2] = 0.5f * square(0.5f + cellDifference);
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private unsafe float GetWeight(uint gx, uint gy)
-        {
-            fixed (float2* ptr = m_Weights)
-            {
-                return GetWeight(ptr, gx, gy);
-            }
+            return (uint2)cellCoordinate;
         }
-
+        
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe float GetWeight(float2* weights, uint gx, uint gy)
         {
             return weights[gx].x * weights[gy].y;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private int GetCellIndex(uint2 cellCoordinate)
-        {
-            return GetCellIndex(m_GridResolution, cellCoordinate);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

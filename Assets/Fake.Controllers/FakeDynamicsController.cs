@@ -63,22 +63,20 @@ namespace Fake.Controllers
             
             var particles = m_Solver.Particles;
 
-            for (int i = 0; i < m_Solver.Particles.Length; i++)
+            for (int i = 0; i < particles.Length; i++)
             {
                 var particle = new Dynamics.Particle
                 {
                     position = positions[i],
-                    velocity = new float2(0.0f),
-                    mass = 0.05f,
+                    displacement = new float2(0.0f),
+                    mass = 1.0f,
                     deformationGradient = new float2x2(
                         1, 0,
-                        0, 1)
+                        0, 1),
                 };
 
                 particles[i] = particle;
             }
-            
-            m_Solver.CalculateParticleVolumes();
         }
     }
 }
