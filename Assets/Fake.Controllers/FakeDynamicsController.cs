@@ -12,6 +12,8 @@ namespace Fake.Controllers
         
         [SerializeField] private ParticleRenderer m_ParticleRenderer;
         [SerializeField] private float2 m_GravitationalAcceleration = (Vector2)Physics.gravity;
+        [Min(0.0f)]
+        [SerializeField] private float m_ParticleMass = 1.0f;
         [SerializeField] private DynamicsSolver.SolverArgs m_SolverArgs;
 
         private DynamicsSolver m_Solver;
@@ -43,6 +45,11 @@ namespace Fake.Controllers
             m_ParticleRenderer.SetParticles(m_Solver.Particles);
         }
 
+        public void RegisterCollisionSolver(ICollisionSolver solver)
+        {
+            m_Solver.RegisterCollisionSolver(solver);
+        }
+        
         private void CreateParticles()
         {
             var positions = new List<float2>();
@@ -69,7 +76,7 @@ namespace Fake.Controllers
                 {
                     position = positions[i],
                     displacement = new float2(0.0f),
-                    mass = 1.0f,
+                    mass = m_ParticleMass,
                     deformationGradient = new float2x2(
                         1, 0,
                         0, 1),

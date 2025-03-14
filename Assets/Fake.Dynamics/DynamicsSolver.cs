@@ -10,10 +10,11 @@ using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Profiling;
-
+using UnityEngine.Serialization;
 using static Unity.Mathematics.math;
 using static Fake.Utilities.MatrixUtility;
 using static Fake.Utilities.FixedPointUtility;
+using float2 = Unity.Mathematics.float2;
 using float2x2 = Unity.Mathematics.float2x2;
 
 namespace Fake.Dynamics
@@ -48,21 +49,19 @@ namespace Fake.Dynamics
                 {
                     float2x2 deviatoric = -1.0f * (particle.deformationDisplacement + transpose(particle.deformationDisplacement));
                     particle.deformationDisplacement += liquidViscosity * 0.5f * deviatoric;
-
+                    
                     float alpha = 0.5f * (1.0f / particle.liquidDensity - Tr(particle.deformationDisplacement) - 1.0f);
                     particle.deformationDisplacement += liquidRelaxation * alpha * float2x2.identity;
                 }
                 if (materialType is MaterialType.Sand)
                 {
-                    particle.deformationGradient = float2x2.identity;
-                    
                     float2x2 F = mul(float2x2.identity + particle.deformationDisplacement, particle.deformationGradient);
                     
                     var svdResult = SingularValuesDecomposition(F);
                     
                     if (particle.logJp == 0.0f)
                     {
-                        svdResult.sigma = clamp(svdResult.sigma, 1.0f, 1000.0f);
+                        svdResult.sigma = clamp(svdResult.sigma, float2(1.0f), float2(1000.0f));
                     }
                     
                     float df = determinant(F);
@@ -154,8 +153,8 @@ namespace Fake.Dynamics
             public Cell* gridPtr;
 
             public uint fixedPointMultiplier;
-            
-            public int gridResolution;
+
+            public MaterialType materialType;
             public float2 acceleration;
             public float deltaTime;
             
@@ -169,25 +168,41 @@ namespace Fake.Dynamics
                 if (mass > 0.0f)
                 {
                     displacement /= mass;
-                    displacement += acceleration * deltaTime;
-
-                    int x = i / gridResolution;
-                    int y = i - x * gridResolution;
-
-                    if (x < 2 || x > gridResolution - 3)
-                    {
-                        displacement.x = 0.0f;
-                    }
-
-                    if (y < 2 || y > gridResolution - 3)
-                    {
-                        displacement.y = 0.0f;
-                    }
 
                     cell.displacement = EncodeFixedPoint(displacement, fixedPointMultiplier);
 
                     gridPtr[i] = cell;
                 }
+            }
+        }
+
+        [BurstCompile]
+        private unsafe struct GridLimitJob : IJobParallelFor
+        {
+            [NativeDisableUnsafePtrRestriction]
+            public Cell* gridPtr;
+            
+            public uint fixedPointMultiplier;
+            public int gridResolution;
+            
+            public void Execute(int i)
+            {
+                float2 displacement = DecodeFixedPoint(gridPtr[i].displacement, fixedPointMultiplier);
+                
+                int x = i / gridResolution;
+                int y = i - x * gridResolution;
+                    
+                if (x < 2 || x > gridResolution - 3)
+                {
+                    displacement.x = 0.0f;
+                }
+
+                if (y < 2 || y > gridResolution - 3)
+                {
+                    displacement.y = 0.0f;
+                }
+                
+                gridPtr[i].displacement = EncodeFixedPoint(displacement, fixedPointMultiplier);
             }
         }
         
@@ -232,7 +247,7 @@ namespace Fake.Dynamics
                         B += OuterProduct(weightedDisplacement, distance);
                         displacement += weightedDisplacement;
 
-                        if (useGridVolumeForLiquid && materialType is MaterialType.Liquid)
+                        if (useGridVolumeForLiquid)
                         {
                             volume += weight * DecodeFixedPoint(cell.volume, fixedPointMultiplier);
                         }
@@ -266,8 +281,8 @@ namespace Fake.Dynamics
             public float elasticityRatio;
             public float frictionAngle;
             public float plasticity;
-            public float gridResolution;
             public float deltaTime;
+            public float2 acceleration;
             
             public void Execute(int i)
             {
@@ -289,7 +304,7 @@ namespace Fake.Dynamics
                     if (materialType is MaterialType.Sand)
                     {
                         float sinPhi = sin(frictionAngle * TORADIANS);
-                        float alpha = sqrt(2.0f / 3.0f) * (2.0f * sinPhi) / (3.0f - sinPhi);
+                        float alpha = sqrt(2.0f / 3.0f) * 2.0f * sinPhi / (3.0f - sinPhi);
                         float beta = 0.5f;
                         
                         float2 eDiag = log(max(abs(svdResult.sigma), 1e-6f));
@@ -323,7 +338,7 @@ namespace Fake.Dynamics
                         var yieldSurface = exp(1.0f - plasticity);
                         var J = svdResult.sigma.x * svdResult.sigma.y;
                         
-                        svdResult.sigma = clamp(svdResult.sigma, 1.0f / yieldSurface, yieldSurface);
+                        svdResult.sigma = clamp(svdResult.sigma, float2(1.0f / yieldSurface), float2(yieldSurface));
                         
                         var newJ = svdResult.sigma.x * svdResult.sigma.y;
                         svdResult.sigma *= sqrt(J / newJ);
@@ -332,16 +347,32 @@ namespace Fake.Dynamics
                     particle.deformationGradient = mul(mul(svdResult.u, Diagonal(svdResult.sigma)), svdResult.vt);
                 }
 
-                particle.position += particle.displacement * deltaTime;
-                particle.position = clamp(particle.position, 1.0f, gridResolution - 2.0f);
+                particle.displacement += acceleration * square(deltaTime);
+                particle.position += particle.displacement;
                 
                 particlePtr[i] = particle;
+            }
+        }
+
+        [BurstCompile]
+        private unsafe struct ParticleLimit : IJobParallelFor
+        {
+            [NativeDisableUnsafePtrRestriction]
+            public Particle* particlePtr;
+            
+            public float gridResolution;
+            
+            public void Execute(int i)
+            {
+                particlePtr[i].position = clamp(particlePtr[i].position, 1.0f, gridResolution - 2.0f);
             }
         }
 
         [Serializable]
         public class SolverArgs
         {
+            [Min(0.0f)]
+            public float SimulationUpdateRateInHz = 120.0f;
             public MaterialType MaterialType;
             [Range(3, 10)]
             public int FixedPointMultiplier = 7;
@@ -373,6 +404,7 @@ namespace Fake.Dynamics
         private bool m_IsDisposed;
 
         private uint m_FixedPointMultiplier;
+        private readonly List<ICollisionSolver> m_CollisionSolvers;
 
         public DynamicsSolver(int gridResolution, SolverArgs args, float2 gravitationalAcceleration)
         {
@@ -381,6 +413,7 @@ namespace Fake.Dynamics
             m_GravitationalAcceleration = gravitationalAcceleration;
             
             m_Grid = new NativeArray<Cell>(gridResolution * gridResolution, Allocator.Persistent);
+            m_CollisionSolvers = new List<ICollisionSolver>();
             
             ClearGrid();
         }
@@ -405,6 +438,12 @@ namespace Fake.Dynamics
             DisposeGrid();
         }
 
+        public void RegisterCollisionSolver(ICollisionSolver solver)
+        {
+            CheckDisposed();
+            m_CollisionSolvers.Add(solver);
+        }
+
         public void Step(float deltaTime)
         {
             CheckDisposed();
@@ -415,7 +454,9 @@ namespace Fake.Dynamics
             {
                 m_FixedPointMultiplier *= 10;
             }
-            
+
+            var updateRateInHz = 1.0f / deltaTime;
+            deltaTime *= m_SolverArgs.SimulationUpdateRateInHz / updateRateInHz;
             deltaTime /= m_SolverArgs.IterationNumber;
             
             for (int i = 0; i < m_SolverArgs.IterationNumber; i++)
@@ -482,7 +523,7 @@ namespace Fake.Dynamics
                 elasticityRatio = m_SolverArgs.ElasticityRatio,
                 liquidRelaxation = m_SolverArgs.LiquidRelaxation,
                 elasticRelaxation = m_SolverArgs.ElasticRelaxation,
-                liquidViscosity = m_SolverArgs.LiquidViscosity
+                liquidViscosity = m_SolverArgs.LiquidViscosity,
             }.Schedule(m_Particles.Length, 64).Complete();
             
             Profiler.EndSample();
@@ -512,9 +553,18 @@ namespace Fake.Dynamics
             {
                 gridPtr = (Cell*)m_Grid.GetUnsafePtr(),
                 fixedPointMultiplier = m_FixedPointMultiplier,
-                gridResolution = m_GridResolution,
+                materialType = m_SolverArgs.MaterialType,
                 acceleration = acceleration,
                 deltaTime = deltaTime
+            }.Schedule(m_Grid.Length, 64).Complete();
+            
+            m_CollisionSolvers.ForEach(solver => solver.ResolveCollisions(m_Grid, m_FixedPointMultiplier, deltaTime));
+            
+            new GridLimitJob
+            {
+                gridPtr = (Cell*)m_Grid.GetUnsafePtr(),
+                fixedPointMultiplier = m_FixedPointMultiplier,
+                gridResolution = m_GridResolution
             }.Schedule(m_Grid.Length, 64).Complete();
             
             Profiler.EndSample();
@@ -547,8 +597,16 @@ namespace Fake.Dynamics
                 elasticityRatio = m_SolverArgs.ElasticityRatio,
                 frictionAngle = m_SolverArgs.FrictionAngle,
                 plasticity = m_SolverArgs.ViscoPlasticity,
-                gridResolution = m_GridResolution,
-                deltaTime = deltaTime
+                deltaTime = deltaTime,
+                acceleration = m_GravitationalAcceleration
+            }.Schedule(m_Particles.Length, 64).Complete();
+            
+            m_CollisionSolvers.ForEach(solver => solver.ResolveCollisions(m_Particles, m_FixedPointMultiplier, deltaTime));
+            
+            new ParticleLimit
+            {
+                particlePtr = (Particle*)m_Particles.GetUnsafePtr(),
+                gridResolution = m_GridResolution
             }.Schedule(m_Particles.Length, 64).Complete();
             
             Profiler.EndSample();
